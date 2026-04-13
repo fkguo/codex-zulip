@@ -12,6 +12,8 @@
 - 默认用 `gpt-5.4` 调用本机 `codex exec`
 - 按 Zulip 对话维度复用 Codex session
 - 支持把 Codex 长输出分片发送
+- 支持下载 Zulip 消息里上传的附件到本地，再把本地路径提供给 Codex
+- 支持 Codex 通过显式指令上传本地文件回当前 Zulip 对话
 - screen 端会实时打印 Codex 的 JSON 事件流和调试日志
 - 支持 `/reset`、`/fresh`、`/session` 控制当前 Zulip 对话的 Codex session
 
@@ -58,6 +60,11 @@ CODEX_SANDBOX=danger-full-access
 CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
 CODEX_ZULIP_SESSION_STORE=/ssd/home/pz/codex-zulip/.codex-zulip-sessions.json
+CODEX_ZULIP_ATTACHMENT_DIR=/ssd/home/pz/codex-zulip/.codex-zulip-downloads
+CODEX_ZULIP_MAX_ATTACHMENTS=8
+CODEX_ZULIP_MAX_ATTACHMENT_BYTES=10485760
+CODEX_ZULIP_INLINE_TEXT_BYTES=20000
+CODEX_ZULIP_DOWNLOAD_TIMEOUT_SECONDS=60
 ```
 
 5. 先确认本机 `codex` 已登录可用
@@ -116,6 +123,24 @@ python3 server.py
 - `/fresh 你的任务`: 忽略当前对话旧 session，这条消息强制创建一个新 session
 - `/session`: 返回当前对话正在使用的 Codex session id
 
+## 附件处理
+
+- 如果用户在 Zulip 消息里上传了文件，服务会解析消息 HTML 里的 `user_uploads` 链接
+- 附件会被下载到 `CODEX_ZULIP_ATTACHMENT_DIR/<message_id>/`
+- 小型 UTF-8 文本附件会额外把内容摘录直接注入 prompt
+- 其他附件会以本地路径形式提供给 Codex，让它按需继续读取
+- 单条消息默认最多处理 8 个附件，单文件默认最大 10 MiB
+
+如果希望 Codex 把本地文件上传回当前 Zulip 对话，需要让它在最终回复里单独输出这样的行：
+
+```text
+ZULIP_UPLOAD: /absolute/or/relative/path/to/file
+```
+
+- 可以输出多行 `ZULIP_UPLOAD: ...`
+- 桥接层会先上传文件，再把返回的 Zulip 文件链接和正常文本说明一起发回原对话
+- 相对路径会按 `CODEX_WORKDIR` 解析
+
 ## 运行日志
 
 终端里可以看到这些调试日志：
@@ -126,6 +151,8 @@ python3 server.py
 - `[codex_cmd]`: 实际调用的 `codex` 命令
 - `[codex_stream]`: Codex 的实时 JSON 事件流
 - `[codex_exit]`: Codex 退出码和输出摘要
+- `[zulip_attachment]`: 入站附件下载日志
+- `[zulip_upload_file]`: 出站文件上传日志
 - `[zulip_send]`: 发回 Zulip 的消息请求
 
 ## 最小排障

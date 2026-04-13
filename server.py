@@ -6,7 +6,11 @@ import shlex
 import tempfile
 import threading
 import time
+from base64 import b64encode
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import pexpect
 import zulip
@@ -31,6 +35,125 @@ SESSION_STORE_PATH = Path(
 )
 THREAD_LOCKS = {}
 THREAD_LOCKS_GUARD = threading.Lock()
+TEXT_ATTACHMENT_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".css",
+    ".csv",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".log",
+    ".md",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".text",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+MARKDOWN_LINK_PATTERN = re.compile(r"(!?)\[([^\]]*)\]\(([^)]+)\)")
+
+
+class MessageContentParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.links = []
+        self.images = []
+        self._current_href = None
+        self._current_link_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_map = dict(attrs)
+        if tag == "br":
+            self.parts.append("\n")
+            return
+        if tag == "li":
+            self.parts.append("- ")
+            return
+        if tag == "a":
+            self._current_href = attrs_map.get("href")
+            self._current_link_parts = []
+            return
+        if tag == "img":
+            src = attrs_map.get("src")
+            alt = attrs_map.get("alt", "")
+            if src:
+                self.images.append({"src": src, "alt": alt})
+
+    def handle_endtag(self, tag):
+        if tag in {"p", "div", "li"}:
+            self.parts.append("\n")
+            return
+        if tag == "a":
+            href = self._current_href
+            text = "".join(self._current_link_parts).strip()
+            if href:
+                self.links.append({"href": href, "text": text or href})
+            self._current_href = None
+            self._current_link_parts = []
+
+    def handle_data(self, data):
+        if not data:
+            return
+        self.parts.append(data)
+        if self._current_href is not None:
+            self._current_link_parts.append(data)
+
+
+def parse_message_content(content):
+    normalized = (content or "").strip()
+    if not normalized:
+        return "", []
+
+    parser = MessageContentParser()
+    parser.feed(normalized)
+    parser.close()
+
+    markdown_links = []
+
+    def replace_markdown_link(match):
+        _is_image, label, href = match.groups()
+        cleaned_href = href.strip()
+        cleaned_label = (label or "").strip() or Path(urlparse(cleaned_href).path).name or cleaned_href
+        markdown_links.append({"href": cleaned_href, "text": cleaned_label})
+        return cleaned_label
+
+    text = html.unescape("".join(parser.parts))
+    text = MARKDOWN_LINK_PATTERN.sub(replace_markdown_link, text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = text.strip()
+
+    links = []
+    seen = set()
+    for item in [*parser.links, *parser.images, *markdown_links]:
+        href = item.get("href") or item.get("src")
+        if not href or href in seen:
+            continue
+        links.append(
+            {
+                "href": href,
+                "text": item.get("text") or item.get("alt") or Path(urlparse(href).path).name or href,
+            }
+        )
+        seen.add(href)
+    return text, links
 
 
 class ConversationSessionStore:
@@ -122,14 +245,8 @@ def chunk_text(text, max_length=3500):
 
 
 def strip_html_to_text(content):
-    normalized = (content or "").strip()
-    if not normalized:
-        return ""
-
-    normalized = normalized.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-    normalized = normalized.replace("</p>", "\n").replace("</li>", "\n").replace("<li>", "- ")
-    normalized = re.sub(r"<[^>]+>", "", normalized)
-    return html.unescape(normalized).strip()
+    text, _links = parse_message_content(content)
+    return text
 
 
 def is_reset_command(text):
@@ -165,6 +282,17 @@ def get_codex_settings():
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
     return codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto
+
+
+def get_attachment_settings():
+    base_dir = Path(
+        ENV.get("CODEX_ZULIP_ATTACHMENT_DIR", Path(__file__).with_name(".codex-zulip-downloads"))
+    )
+    max_attachments = int(ENV.get("CODEX_ZULIP_MAX_ATTACHMENTS", "8"))
+    max_bytes = int(ENV.get("CODEX_ZULIP_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))
+    inline_text_bytes = int(ENV.get("CODEX_ZULIP_INLINE_TEXT_BYTES", "20000"))
+    download_timeout = int(ENV.get("CODEX_ZULIP_DOWNLOAD_TIMEOUT_SECONDS", "60"))
+    return base_dir, max_attachments, max_bytes, inline_text_bytes, download_timeout
 
 
 def build_codex_exec_args(prompt, output_file):
@@ -257,6 +385,279 @@ def read_output_file(path):
     if not output_path.exists():
         return ""
     return output_path.read_text(encoding="utf-8").strip()
+
+
+def is_attachment_link(href):
+    parsed = urlparse(href)
+    return "/user_uploads/" in (parsed.path or "")
+
+
+def build_attachment_download_dir(message):
+    base_dir, _max_attachments, _max_bytes, _inline_text_bytes, _download_timeout = get_attachment_settings()
+    message_id = message.get("id", "unknown")
+    directory = base_dir / str(message_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def absolutize_url(href):
+    return urljoin(ENV["ZULIP_SITE"], href)
+
+
+def build_basic_auth_header():
+    raw = f"{ENV['ZULIP_EMAIL']}:{ENV['ZULIP_API_KEY']}".encode("utf-8")
+    return f"Basic {b64encode(raw).decode('ascii')}"
+
+
+def sanitize_attachment_name(name, fallback="attachment"):
+    candidate = Path(name or fallback).name.strip() or fallback
+    return candidate
+
+
+def allocate_attachment_path(directory, name):
+    target = directory / sanitize_attachment_name(name)
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix
+    for index in range(1, 1000):
+        candidate = directory / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate attachment path for {name!r}")
+
+
+def fetch_temporary_upload_url(client, source_url):
+    parsed = urlparse(source_url)
+    match = re.search(r"/user_uploads/([^/]+)/(.+)$", parsed.path or "")
+    if not match:
+        return source_url
+
+    realm_id = match.group(1)
+    filename = match.group(2)
+    result = client.call_endpoint(url=f"user_uploads/{realm_id}/{filename}", method="GET")
+    if result.get("result") != "success" or not result.get("url"):
+        raise RuntimeError(f"Failed to get temporary file URL: {result}")
+    return absolutize_url(result["url"])
+
+
+def download_remote_file(url, destination, max_bytes, timeout, use_auth):
+    headers = {}
+    if use_auth:
+        headers["Authorization"] = build_basic_auth_header()
+
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=timeout) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
+            raise RuntimeError(f"Attachment exceeds {max_bytes} bytes.")
+
+        data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise RuntimeError(f"Attachment exceeds {max_bytes} bytes.")
+
+    destination.write_bytes(data)
+    return len(data)
+
+
+def try_decode_inline_text(path, max_bytes):
+    if path.suffix.lower() not in TEXT_ATTACHMENT_EXTENSIONS:
+        return None
+
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        return None
+    if b"\x00" in data:
+        return None
+
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def download_message_attachments(client, message, links):
+    attachments = []
+    directory = build_attachment_download_dir(message)
+    _base_dir, max_attachments, max_bytes, inline_text_bytes, download_timeout = get_attachment_settings()
+
+    candidates = [item for item in links if is_attachment_link(item.get("href", ""))]
+    for item in candidates[:max_attachments]:
+        source_url = absolutize_url(item["href"])
+        filename = item.get("text") or Path(urlparse(source_url).path).name or "attachment"
+        local_path = allocate_attachment_path(directory, filename)
+        attachment = {
+            "display_name": sanitize_attachment_name(filename),
+            "source_url": source_url,
+            "local_path": str(local_path),
+        }
+
+        try:
+            temporary_url = fetch_temporary_upload_url(client, source_url)
+            size_bytes = download_remote_file(
+                temporary_url,
+                local_path,
+                max_bytes=max_bytes,
+                timeout=download_timeout,
+                use_auth=False,
+            )
+        except Exception as temp_exc:
+            print(
+                "[zulip_attachment]"
+                f" message_id={message.get('id', '-')}"
+                f" source_url={json.dumps(source_url, ensure_ascii=True)}"
+                f" fallback=direct_get"
+                f" error={temp_exc!r}",
+                flush=True,
+            )
+            try:
+                size_bytes = download_remote_file(
+                    source_url,
+                    local_path,
+                    max_bytes=max_bytes,
+                    timeout=download_timeout,
+                    use_auth=True,
+                )
+            except Exception as download_exc:
+                attachment["error"] = repr(download_exc)
+                attachments.append(attachment)
+                print(
+                    "[zulip_attachment]"
+                    f" message_id={message.get('id', '-')}"
+                    f" source_url={json.dumps(source_url, ensure_ascii=True)}"
+                    f" status=failed"
+                    f" error={download_exc!r}",
+                    flush=True,
+                )
+                continue
+
+        attachment["size_bytes"] = size_bytes
+        attachment["inline_text"] = try_decode_inline_text(local_path, inline_text_bytes)
+        attachments.append(attachment)
+        print(
+            "[zulip_attachment]"
+            f" message_id={message.get('id', '-')}"
+            f" source_url={json.dumps(source_url, ensure_ascii=True)}"
+            f" local_path={json.dumps(str(local_path), ensure_ascii=True)}"
+            f" size_bytes={size_bytes}",
+            flush=True,
+        )
+
+    return attachments
+
+
+def build_codex_prompt(user_prompt, attachments):
+    normalized_prompt = (user_prompt or "").strip() or "The user sent attachments without additional text."
+    sections = [
+        "You are replying through a Zulip bridge.",
+        "If you want the bridge to upload a local file back to Zulip, include one line exactly as:",
+        "ZULIP_UPLOAD: /absolute/or/relative/path/to/file",
+        "Keep any normal user-facing explanation outside those directive lines.",
+        "When writing LaTeX formulas for Zulip, always wrap every formula in $$...$$.",
+        "Do not put any newline inside $$...$$.",
+        "Put one space before and one space after each $$...$$ formula when it touches surrounding text.",
+        "",
+        "User message:",
+        normalized_prompt,
+    ]
+
+    if attachments:
+        sections.extend(["", "Downloaded Zulip attachments:"])
+        for index, attachment in enumerate(attachments, start=1):
+            sections.append(f"{index}. filename: {attachment['display_name']}")
+            sections.append(f"   local_path: {attachment['local_path']}")
+            sections.append(f"   source_url: {attachment['source_url']}")
+            if attachment.get("size_bytes") is not None:
+                sections.append(f"   size_bytes: {attachment['size_bytes']}")
+            if attachment.get("error"):
+                sections.append(f"   download_error: {attachment['error']}")
+            inline_text = attachment.get("inline_text")
+            if inline_text:
+                sections.append(f"   inline_text_utf8:\n{inline_text}")
+
+    return "\n".join(sections).strip()
+
+
+def split_upload_directives(text):
+    upload_paths = []
+    visible_lines = []
+
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ZULIP_UPLOAD:"):
+            path = stripped[len("ZULIP_UPLOAD:") :].strip().strip("`")
+            if path and path not in upload_paths:
+                upload_paths.append(path)
+            continue
+        visible_lines.append(line)
+
+    visible_text = "\n".join(visible_lines).strip()
+    return visible_text, upload_paths
+
+
+def resolve_upload_path(path_text):
+    path = Path(path_text).expanduser()
+    if path.is_absolute():
+        return path
+    _codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+    return Path(workdir) / path
+
+
+def escape_markdown_link_text(text):
+    return (text or "").replace("[", "(").replace("]", ")")
+
+
+def upload_requested_files(client, requested_paths):
+    uploaded_links = []
+    errors = []
+
+    for raw_path in requested_paths:
+        resolved_path = resolve_upload_path(raw_path)
+        if not resolved_path.exists() or not resolved_path.is_file():
+            errors.append(f"未上传 `{raw_path}`：文件不存在。")
+            continue
+
+        try:
+            with resolved_path.open("rb") as fp:
+                result = client.upload_file(fp)
+            if result.get("result") != "success":
+                raise RuntimeError(f"upload failed: {result}")
+            url = result.get("url") or result.get("uri")
+            filename = result.get("filename") or resolved_path.name
+            if not url:
+                raise RuntimeError(f"missing upload URL: {result}")
+            uploaded_links.append(f"[{escape_markdown_link_text(filename)}]({url})")
+            print(
+                "[zulip_upload_file]"
+                f" local_path={json.dumps(str(resolved_path), ensure_ascii=True)}"
+                f" url={json.dumps(url, ensure_ascii=True)}",
+                flush=True,
+            )
+        except Exception as exc:
+            errors.append(f"未上传 `{raw_path}`：`{exc!r}`")
+            print(
+                "[zulip_upload_file]"
+                f" local_path={json.dumps(str(resolved_path), ensure_ascii=True)}"
+                f" error={exc!r}",
+                flush=True,
+            )
+
+    return uploaded_links, errors
+
+
+def build_final_reply(result_text, uploaded_links, upload_errors):
+    sections = []
+    normalized_result = (result_text or "").strip()
+    if normalized_result:
+        sections.append(normalized_result)
+    if uploaded_links:
+        sections.append("已上传文件：\n" + "\n".join(uploaded_links))
+    if upload_errors:
+        sections.append("\n".join(upload_errors))
+
+    if sections:
+        return "\n\n".join(sections).strip()
+    return "Codex finished without returning text."
 
 
 def parse_codex_json_events(text):
@@ -414,9 +815,9 @@ def get_thread_lock(thread_key):
         return lock
 
 
-def extract_prompt(message):
-    content = strip_html_to_text(message.get("content", ""))
-    return content.strip()
+def extract_message_context(message):
+    prompt, links = parse_message_content(message.get("content", ""))
+    return prompt.strip(), links
 
 
 def build_status_text(session_id, force_fresh):
@@ -474,10 +875,11 @@ def should_skip_message(message):
 
 
 def process_message(client, message):
-    prompt = extract_prompt(message)
+    prompt, links = extract_message_context(message)
     thread_key = make_conversation_key(message)
     try:
-        if not prompt:
+        attachment_links = [item for item in links if is_attachment_link(item.get("href", ""))]
+        if not prompt and not attachment_links:
             send_message(client, message, "给我一个具体任务，再让我调用 Codex。")
             return
 
@@ -502,7 +904,7 @@ def process_message(client, message):
 
             force_fresh = is_fresh_command(prompt)
             effective_prompt = strip_fresh_command(prompt) if force_fresh else prompt
-            if not effective_prompt:
+            if not effective_prompt and not attachment_links:
                 send_message(client, message, "`/fresh` 后面要跟具体任务。")
                 return
 
@@ -514,7 +916,9 @@ def process_message(client, message):
             )
             send_message(client, message, build_status_text(existing_session_id, force_fresh))
 
-            next_session_id, result = run_codex(effective_prompt, session_id=existing_session_id)
+            attachments = download_message_attachments(client, message, links)
+            codex_prompt = build_codex_prompt(effective_prompt, attachments)
+            next_session_id, result = run_codex(codex_prompt, session_id=existing_session_id)
             print(
                 "[codex_result]"
                 f" thread_key={thread_key}"
@@ -530,7 +934,7 @@ def process_message(client, message):
                 )
                 SESSION_STORE.delete(thread_key)
                 send_message(client, message, "当前 Zulip 对话的 Codex 会话不可恢复，正在自动重建新会话。")
-                next_session_id, result = run_codex(effective_prompt)
+                next_session_id, result = run_codex(codex_prompt)
 
             if next_session_id and next_session_id != existing_session_id:
                 SESSION_STORE.set(thread_key, next_session_id)
@@ -543,7 +947,10 @@ def process_message(client, message):
                 existing_session_id=existing_session_id,
                 next_session_id=next_session_id,
             )
-            post_chunks(client, message, result)
+            visible_result, upload_paths = split_upload_directives(result)
+            uploaded_links, upload_errors = upload_requested_files(client, upload_paths)
+            final_reply = build_final_reply(visible_result, uploaded_links, upload_errors)
+            post_chunks(client, message, final_reply)
     except Exception as exc:
         print(
             "[process_error]"
