@@ -273,11 +273,123 @@ def strip_fresh_command(text):
     return normalized
 
 
+def format_zulip_display_math(body):
+    normalized = (body or "").strip()
+    if not normalized:
+        return ""
+    return f"\n```math\n{normalized}\n```\n"
+
+
+def has_explicit_math_delimiters(text):
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    pairs = [
+        (r"\[", r"\]"),
+        (r"\(", r"\)"),
+        ("$$", "$$"),
+        ("$", "$"),
+    ]
+    for left, right in pairs:
+        if normalized.startswith(left) and normalized.endswith(right):
+            inner = normalized[len(left) : len(normalized) - len(right)].strip()
+            if inner:
+                return True
+    return False
+
+
+def unwrap_math_delimiters(text):
+    normalized = (text or "").strip()
+    pairs = [
+        (r"\[", r"\]"),
+        (r"\(", r"\)"),
+        ("$$", "$$"),
+        ("$", "$"),
+    ]
+    for left, right in pairs:
+        if normalized.startswith(left) and normalized.endswith(right):
+            inner = normalized[len(left) : len(normalized) - len(right)].strip()
+            if inner:
+                return inner
+    return normalized
+
+
+def normalize_plain_zulip_math(text):
+    if not text:
+        return text
+
+    def replace_bracket_display(match):
+        return format_zulip_display_math(match.group(1))
+
+    def replace_line_display_dollars(match):
+        return format_zulip_display_math(match.group(1))
+
+    def replace_multiline_dollars(match):
+        body = match.group(1)
+        if "\n" not in body:
+            return match.group(0)
+        return format_zulip_display_math(body)
+
+    def replace_paren_inline(match):
+        body = match.group(1).strip()
+        if not body:
+            return match.group(0)
+        return f"$${body}$$"
+
+    def replace_single_inline(match):
+        body = match.group(1)
+        if not body:
+            return match.group(0)
+        if body[0].isspace() or body[-1].isspace():
+            return match.group(0)
+        return f"$${body}$$"
+
+    text = re.sub(r"(?s)\\\[\s*(.*?)\s*\\\]", replace_bracket_display, text)
+    text = re.sub(r"(?m)^[ \t]*\$\$([^\n]+?)\$\$[ \t]*$", replace_line_display_dollars, text)
+    text = re.sub(r"(?s)(?<!\$)\$\$(.+?)\$\$(?!\$)", replace_multiline_dollars, text)
+    text = re.sub(r"(?s)\\\((.+?)\\\)", replace_paren_inline, text)
+    text = re.sub(r"(?<!\\)(?<!\$)\$(?!\$)([^$\n]+?)(?<!\\)\$(?!\$)", replace_single_inline, text)
+    return text
+
+
+def normalize_zulip_math_markup(text):
+    if not text:
+        return text
+
+    fenced_parts = re.split(r"(```[\s\S]*?```)", text)
+    normalized_parts = []
+    for fenced_part in fenced_parts:
+        if fenced_part.startswith("```") and fenced_part.endswith("```"):
+            normalized_parts.append(fenced_part)
+            continue
+
+        inline_parts = re.split(r"(`[^`\n]+`)", fenced_part)
+        for inline_part in inline_parts:
+            if inline_part.startswith("`") and inline_part.endswith("`"):
+                inline_body = inline_part[1:-1]
+                if has_explicit_math_delimiters(inline_body):
+                    normalized_parts.append(f"$${unwrap_math_delimiters(inline_body)}$$")
+                else:
+                    normalized_parts.append(inline_part)
+            else:
+                normalized_parts.append(normalize_plain_zulip_math(inline_part))
+
+    return "".join(normalized_parts)
+
+
+def parse_codex_timeout(value, default=900):
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return None if timeout <= 0 else timeout
+
+
 def get_codex_settings():
     codex_bin = ENV.get("CODEX_BIN", "codex")
     model = ENV.get("OPENAI_MODEL", "gpt-5.4")
     workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
-    timeout = int(ENV.get("CODEX_TIMEOUT_SECONDS", "900"))
+    timeout = parse_codex_timeout(ENV.get("CODEX_TIMEOUT_SECONDS", "900"))
     sandbox = ENV.get("CODEX_SANDBOX", "workspace-write")
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
@@ -553,9 +665,13 @@ def build_codex_prompt(user_prompt, attachments):
         "If you want the bridge to upload a local file back to Zulip, include one line exactly as:",
         "ZULIP_UPLOAD: /absolute/or/relative/path/to/file",
         "Keep any normal user-facing explanation outside those directive lines.",
-        "When writing LaTeX formulas for Zulip, always wrap every formula in $$...$$.",
-        "Do not put any newline inside $$...$$.",
-        "Put one space before and one space after each $$...$$ formula when it touches surrounding text.",
+        "When writing math for Zulip, format inline math as $$...$$.",
+        "Format display math as fenced math blocks:",
+        "```math",
+        "...",
+        "```",
+        "Never wrap math in backticks.",
+        "Keep shell commands, file paths, filenames, and code in backticks or normal code fences.",
         "",
         "User message:",
         normalized_prompt,
@@ -861,7 +977,16 @@ def send_message(client, message, content):
 
 
 def post_chunks(client, message, text):
-    for chunk in chunk_text(text):
+    normalized = normalize_zulip_math_markup(text)
+    if normalized != text:
+        print(
+            "[zulip_format]"
+            f" normalized_math=1"
+            f" original_length={len(text or '')}"
+            f" normalized_length={len(normalized or '')}",
+            flush=True,
+        )
+    for chunk in chunk_text(normalized):
         send_message(client, message, chunk)
 
 
