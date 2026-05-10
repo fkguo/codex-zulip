@@ -9,13 +9,13 @@
 ## 当前能力
 
 - 支持频道消息和私聊消息
-- 默认用 `gpt-5.4` 调用本机 `codex exec`
+- 默认用 `gpt-5.5` 调用本机 `codex exec`
 - 按 Zulip 对话维度复用 Codex session
 - 支持把 Codex 长输出分片发送
 - 支持下载 Zulip 消息里上传的附件到本地，再把本地路径提供给 Codex
 - 支持 Codex 通过显式指令上传本地文件回当前 Zulip 对话
 - screen 端会实时打印 Codex 的 JSON 事件流和调试日志
-- 支持 `/reset`、`/fresh`、`/session` 控制当前 Zulip 对话的 Codex session
+- 支持 `/reset`、`/fresh`、`/session`、`/attach`、`/effort`、`/progress`、`/guide`、`/queue` 控制当前 Zulip 对话的 Codex session、thinking depth、进度回传和消息分发方式
 
 ## 目录结构
 
@@ -47,7 +47,7 @@ cp .env.example .env
 4. 填写 `.env`
 
 ```env
-OPENAI_MODEL=gpt-5.4
+OPENAI_MODEL=gpt-5.5
 
 ZULIP_SITE=https://your-zulip.example.com
 ZULIP_EMAIL=codex-bot@example.com
@@ -59,6 +59,9 @@ CODEX_TIMEOUT_SECONDS=900
 CODEX_SANDBOX=danger-full-access
 CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
+CODEX_REASONING_EFFORT=
+CODEX_ZULIP_PROGRESS=off
+CODEX_ZULIP_PROGRESS_INTERVAL_SECONDS=10
 CODEX_ZULIP_SESSION_STORE=/ssd/home/pz/codex-zulip/.codex-zulip-sessions.json
 CODEX_ZULIP_ATTACHMENT_DIR=/ssd/home/pz/codex-zulip/.codex-zulip-downloads
 CODEX_ZULIP_MAX_ATTACHMENTS=8
@@ -122,6 +125,16 @@ python3 server.py
 - `/reset`: 清掉当前对话的 Codex session
 - `/fresh 你的任务`: 忽略当前对话旧 session，这条消息强制创建一个新 session
 - `/session`: 返回当前对话正在使用的 Codex session id
+- `/attach <session_id>`: 把当前 Zulip 对话绑定到一个已有 Codex CLI session
+- `/effort <none|minimal|low|medium|high|xhigh>`: 设置当前 Zulip 对话的持久 reasoning effort 覆盖；不影响正在运行中的 turn
+- `/effort clear`: 清除当前 Zulip 对话的 reasoning effort 覆盖，之后回到 `CODEX_REASONING_EFFORT` 或 Codex 默认配置
+- `/progress <on|text|steps|off|status|clear>`: 控制当前 Zulip 对话是否接收 Codex 中间回传；`on`/`text` 回传 Codex 自己输出的中间文字片段并做基础脱敏，`steps` 只回传泛化阶段状态，不需要重启 server
+- `/guide 你的任务`: 按引导模式发送给 Codex，并要求 Codex 对非平凡修改或审核分配 subagents 做独立核验
+- `/queue 你的任务`: 先回复“已排队”，再按当前 Zulip 对话的串行队列执行；执行时同样要求 subagents 做独立核验
+
+`/attach` 之后，当前 Zulip 对话里的普通消息默认继续这个 attached session。attached session 如果无法 `resume`，服务会报错并保留绑定，不会自动静默重建新会话；可以重新 `/attach <session_id>`，或用 `/fresh 你的任务` 显式新建会话。
+
+也可以使用中文前缀 `引导: 你的任务`、`排队: 你的任务`、`/引导 你的任务`、`/排队 你的任务`。Zulip 桥当前不会打断正在运行的 Codex turn；`/queue` 的语义是显式加入当前对话的串行后续任务，并立即给用户确认。普通消息如果遇到当前对话已有任务在运行，也会自动排队并给出确认。
 
 ## 附件处理
 

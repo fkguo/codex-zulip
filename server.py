@@ -6,6 +6,7 @@ import shlex
 import tempfile
 import threading
 import time
+from collections import deque
 from base64 import b64encode
 from html.parser import HTMLParser
 from pathlib import Path
@@ -35,6 +36,8 @@ SESSION_STORE_PATH = Path(
 )
 THREAD_LOCKS = {}
 THREAD_LOCKS_GUARD = threading.Lock()
+THREAD_WORK_QUEUES = {}
+THREAD_WORK_QUEUES_GUARD = threading.Lock()
 TEXT_ATTACHMENT_EXTENSIONS = {
     ".c",
     ".cc",
@@ -66,6 +69,76 @@ TEXT_ATTACHMENT_EXTENSIONS = {
     ".yml",
 }
 MARKDOWN_LINK_PATTERN = re.compile(r"(!?)\[([^\]]*)\]\(([^)]+)\)")
+REASONING_EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
+PROGRESS_VALUES = {"off", "steps", "text"}
+SESSION_ID_PATTERN = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)\s*=\s*([^\s`'\";,]+)"
+)
+AUTH_BEARER_PATTERN = re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+([^\s`'\";,]+)")
+OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+
+
+def normalize_reasoning_effort(value):
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in REASONING_EFFORT_VALUES:
+        return normalized
+    return None
+
+
+def normalize_progress_value(value):
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "enable", "enabled", "on"}:
+        return "text"
+    if normalized in {"0", "false", "no", "disable", "disabled"}:
+        return "off"
+    if normalized in {"event", "events", "stage", "stages", "step"}:
+        return "steps"
+    if normalized in {"summary", "summaries", "message", "messages"}:
+        return "text"
+    if normalized in PROGRESS_VALUES:
+        return normalized
+    return None
+
+
+def redact_sensitive_text(text):
+    redacted = str(text or "")
+    redacted = AUTH_BEARER_PATTERN.sub(r"\1 <redacted>", redacted)
+    redacted = SECRET_ASSIGNMENT_PATTERN.sub(r"\1=<redacted>", redacted)
+    redacted = OPENAI_KEY_PATTERN.sub("sk-<redacted>", redacted)
+    redacted = SESSION_ID_PATTERN.sub("<session-id>", redacted)
+    return redacted
+
+
+def compact_log_id(value):
+    if not value:
+        return "-"
+    text = str(value)
+    if SESSION_ID_PATTERN.fullmatch(text):
+        return f"{text[:8]}...{text[-4:]}"
+    return redact_sensitive_text(text)
+
+
+def summarize_logged_codex_args(args):
+    safe_args = []
+    last_index = len(args) - 1
+    for index, arg in enumerate(args):
+        if index == last_index:
+            safe_args.append(f"<prompt chars={len(str(arg))}>")
+        else:
+            safe_args.append(redact_sensitive_text(arg))
+    return safe_args
+
+
+def normalize_progress_compare_text(text):
+    return re.sub(r"\s+", " ", (text or "").strip())
 
 
 class MessageContentParser(HTMLParser):
@@ -175,11 +248,27 @@ class ConversationSessionStore:
         normalized = {}
         for key, value in data.items():
             if isinstance(value, str):
-                normalized[key] = {"session_id": value, "updated_at": 0}
-            elif isinstance(value, dict) and isinstance(value.get("session_id"), str):
                 normalized[key] = {
-                    "session_id": value["session_id"],
+                    "session_id": value,
+                    "updated_at": 0,
+                    "attached": False,
+                    "effort": None,
+                    "progress": None,
+                }
+            elif isinstance(value, dict):
+                session_id = value.get("session_id")
+                effort = normalize_reasoning_effort(value.get("effort"))
+                progress = normalize_progress_value(value.get("progress"))
+                if session_id is not None and not isinstance(session_id, str):
+                    continue
+                if session_id is None and effort is None and progress is None:
+                    continue
+                normalized[key] = {
+                    "session_id": session_id,
                     "updated_at": value.get("updated_at", 0),
+                    "attached": bool(value.get("attached", False)),
+                    "effort": effort,
+                    "progress": progress,
                 }
         return normalized
 
@@ -205,11 +294,15 @@ class ConversationSessionStore:
                 return None
             return entry.get("session_id")
 
-    def set(self, key, session_id):
+    def set(self, key, session_id, attached=False):
         with self._lock:
+            existing = self._sessions.get(key) or {}
             self._sessions[key] = {
                 "session_id": session_id,
                 "updated_at": int(time.time()),
+                "attached": bool(attached),
+                "effort": existing.get("effort"),
+                "progress": existing.get("progress"),
             }
             self._save_locked()
 
@@ -225,6 +318,75 @@ class ConversationSessionStore:
             if not entry:
                 return
             entry["updated_at"] = int(time.time())
+            self._save_locked()
+
+    def is_attached(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return False
+            return bool(entry.get("attached", False))
+
+    def get_effort(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_reasoning_effort(entry.get("effort"))
+
+    def set_effort(self, key, effort):
+        normalized_effort = normalize_reasoning_effort(effort)
+        if normalized_effort is None:
+            raise ValueError(f"Invalid reasoning effort: {effort}")
+        with self._lock:
+            existing = self._sessions.get(key) or {}
+            self._sessions[key] = {
+                "session_id": existing.get("session_id"),
+                "updated_at": int(time.time()),
+                "attached": bool(existing.get("attached", False)),
+                "effort": normalized_effort,
+                "progress": existing.get("progress"),
+            }
+            self._save_locked()
+
+    def clear_effort(self, key):
+        with self._lock:
+            existing = self._sessions.get(key)
+            if not existing:
+                return
+            existing["effort"] = None
+            existing["updated_at"] = int(time.time())
+            self._save_locked()
+
+    def get_progress(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_progress_value(entry.get("progress"))
+
+    def set_progress(self, key, value):
+        normalized_progress = normalize_progress_value(value)
+        if normalized_progress is None:
+            raise ValueError(f"Invalid progress value: {value}")
+        with self._lock:
+            existing = self._sessions.get(key) or {}
+            self._sessions[key] = {
+                "session_id": existing.get("session_id"),
+                "updated_at": int(time.time()),
+                "attached": bool(existing.get("attached", False)),
+                "effort": existing.get("effort"),
+                "progress": normalized_progress,
+            }
+            self._save_locked()
+
+    def clear_progress(self, key):
+        with self._lock:
+            existing = self._sessions.get(key)
+            if not existing:
+                return
+            existing["progress"] = None
+            existing["updated_at"] = int(time.time())
             self._save_locked()
 
 
@@ -262,6 +424,86 @@ def is_fresh_command(text):
 def is_session_command(text):
     normalized = (text or "").strip().lower()
     return normalized in {"/session", "session", "session id"}
+
+
+def is_effort_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized == "/effort" or normalized.startswith("/effort ")
+
+
+def parse_effort_value(text):
+    normalized = (text or "").strip()
+    if normalized.lower() == "/effort":
+        return ""
+    if normalized.lower().startswith("/effort "):
+        return normalized[len("/effort ") :].strip().lower()
+    return ""
+
+
+def is_progress_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized == "/progress" or normalized.startswith("/progress ")
+
+
+def parse_progress_value(text):
+    normalized = (text or "").strip()
+    if normalized.lower() == "/progress":
+        return ""
+    if normalized.lower().startswith("/progress "):
+        return normalized[len("/progress ") :].strip().lower()
+    return ""
+
+
+def is_attach_command(text):
+    normalized = (text or "").strip()
+    return normalized == "/attach" or normalized.startswith("/attach ")
+
+
+def parse_attach_session_id(text):
+    normalized = (text or "").strip()
+    if normalized == "/attach":
+        return ""
+    if normalized.startswith("/attach "):
+        return normalized[len("/attach ") :].strip()
+    return ""
+
+
+def parse_dispatch_directive(text):
+    normalized = (text or "").strip()
+    if not normalized:
+        return "normal", ""
+
+    slash_commands = [
+        ("/guide", "guide"),
+        ("/steer", "guide"),
+        ("/引导", "guide"),
+        ("/queue", "queue"),
+        ("/排队", "queue"),
+    ]
+    lowered = normalized.lower()
+    for command, mode in slash_commands:
+        if lowered == command:
+            return mode, ""
+        if lowered.startswith(command + " "):
+            return mode, normalized[len(command) :].strip()
+
+    label_commands = [
+        ("guide", "guide"),
+        ("steer", "guide"),
+        ("引导", "guide"),
+        ("queue", "queue"),
+        ("排队", "queue"),
+    ]
+    for label, mode in label_commands:
+        label_lowered = label.lower()
+        for separator in (":", "："):
+            prefix = label_lowered + separator
+            if lowered.startswith(prefix):
+                return mode, normalized[len(label + separator) :].strip()
+        if lowered.startswith(label_lowered + " "):
+            return mode, normalized[len(label) :].strip()
+
+    return "normal", normalized
 
 
 def strip_fresh_command(text):
@@ -387,13 +629,43 @@ def parse_codex_timeout(value, default=900):
 
 def get_codex_settings():
     codex_bin = ENV.get("CODEX_BIN", "codex")
-    model = ENV.get("OPENAI_MODEL", "gpt-5.4")
+    model = ENV.get("OPENAI_MODEL", "gpt-5.5")
     workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
     timeout = parse_codex_timeout(ENV.get("CODEX_TIMEOUT_SECONDS", "900"))
     sandbox = ENV.get("CODEX_SANDBOX", "workspace-write")
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
     return codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto
+
+
+def get_default_reasoning_effort():
+    return normalize_reasoning_effort(ENV.get("CODEX_REASONING_EFFORT"))
+
+
+def get_default_progress_value():
+    return normalize_progress_value(ENV.get("CODEX_ZULIP_PROGRESS")) or "off"
+
+
+def get_progress_mode(thread_key):
+    return SESSION_STORE.get_progress(thread_key) or get_default_progress_value()
+
+
+def is_progress_enabled(thread_key):
+    return get_progress_mode(thread_key) != "off"
+
+
+def get_progress_interval_seconds():
+    try:
+        value = int(ENV.get("CODEX_ZULIP_PROGRESS_INTERVAL_SECONDS", "10"))
+    except (TypeError, ValueError):
+        value = 10
+    return max(1, value)
+
+
+def append_reasoning_effort_arg(args, reasoning_effort):
+    effort = normalize_reasoning_effort(reasoning_effort) or get_default_reasoning_effort()
+    if effort:
+        args.extend(["-c", f"model_reasoning_effort={json.dumps(effort)}"])
 
 
 def get_attachment_settings():
@@ -407,7 +679,7 @@ def get_attachment_settings():
     return base_dir, max_attachments, max_bytes, inline_text_bytes, download_timeout
 
 
-def build_codex_exec_args(prompt, output_file):
+def build_codex_exec_args(prompt, output_file, reasoning_effort=None):
     codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
     args = [
         "exec",
@@ -426,12 +698,13 @@ def build_codex_exec_args(prompt, output_file):
         args.append("--full-auto")
     if extra_args:
         args.extend(shlex.split(extra_args))
+    append_reasoning_effort_arg(args, reasoning_effort)
     args.append(prompt)
     return codex_bin, args, timeout, workdir
 
 
-def build_codex_resume_args(session_id, prompt, output_file):
-    codex_bin, model, workdir, timeout, _sandbox, _extra_args, full_auto = get_codex_settings()
+def build_codex_resume_args(session_id, prompt, output_file, reasoning_effort=None):
+    codex_bin, model, workdir, timeout, _sandbox, extra_args, full_auto = get_codex_settings()
     args = [
         "exec",
         "resume",
@@ -444,6 +717,9 @@ def build_codex_resume_args(session_id, prompt, output_file):
     ]
     if full_auto:
         args.append("--full-auto")
+    if extra_args:
+        args.extend(shlex.split(extra_args))
+    append_reasoning_effort_arg(args, reasoning_effort)
     args.extend([session_id, prompt])
     return codex_bin, args, timeout, workdir
 
@@ -658,7 +934,7 @@ def download_message_attachments(client, message, links):
     return attachments
 
 
-def build_codex_prompt(user_prompt, attachments):
+def build_codex_prompt(user_prompt, attachments, dispatch_mode="normal", progress_mode="off"):
     normalized_prompt = (user_prompt or "").strip() or "The user sent attachments without additional text."
     sections = [
         "You are replying through a Zulip bridge.",
@@ -672,10 +948,44 @@ def build_codex_prompt(user_prompt, attachments):
         "```",
         "Never wrap math in backticks.",
         "Keep shell commands, file paths, filenames, and code in backticks or normal code fences.",
-        "",
-        "User message:",
-        normalized_prompt,
     ]
+
+    if dispatch_mode == "guide":
+        sections.extend(
+            [
+                "",
+                "Zulip dispatch mode: guide.",
+                "Treat the user message as guidance for the active task or next turn.",
+                "For non-trivial changes or reviews, delegate independent review/verification to Codex native subagents when available, then integrate their findings before the final answer.",
+            ]
+        )
+    elif dispatch_mode == "queue":
+        sections.extend(
+            [
+                "",
+                "Zulip dispatch mode: queue.",
+                "This message was explicitly queued by the Zulip user; execute it as a follow-up after earlier work in this Zulip conversation.",
+                "For non-trivial changes or reviews, delegate independent review/verification to Codex native subagents when available, then integrate their findings before the final answer.",
+            ]
+        )
+
+    if progress_mode == "text":
+        sections.extend(
+            [
+                "",
+                "Zulip progress mode: text.",
+                "For long or multi-step work, send concise user-facing interim summaries as normal assistant messages after meaningful phases.",
+                "Do not expose raw command output, secrets, or noisy implementation logs in these interim summaries.",
+            ]
+        )
+
+    sections.extend(
+        [
+            "",
+            "User message:",
+            normalized_prompt,
+        ]
+    )
 
     if attachments:
         sections.extend(["", "Downloaded Zulip attachments:"])
@@ -806,8 +1116,84 @@ def parse_codex_json_events(text):
     return session_id, "\n\n".join(messages).strip()
 
 
-def stream_codex_output(child, timeout, mode):
+def summarize_progress_event(event):
+    event_type = event.get("type") or "-"
+    if event_type == "thread.started":
+        return "Codex 会话已启动。"
+
+    item = event.get("item") or {}
+    item_type = item.get("type")
+    if event_type in {"item.started", "item.completed"}:
+        if item_type == "reasoning":
+            return "Codex 正在推理。" if event_type == "item.started" else "Codex 完成一段推理。"
+        if item_type == "command_execution":
+            return "Codex 正在运行命令。" if event_type == "item.started" else "Codex 完成命令执行。"
+        if item_type in {"tool_call", "function_call"}:
+            return "Codex 正在调用工具。" if event_type == "item.started" else "Codex 完成工具调用。"
+        if item_type == "agent_message" and event_type == "item.completed":
+            return "Codex 已生成一段回复。"
+
+    return None
+
+
+def extract_agent_message_text(event):
+    event_type = event.get("type") or "-"
+    if event_type not in {"item.completed", "item.updated", "item.delta"}:
+        return None
+
+    item = event.get("item") or {}
+    if item.get("type") != "agent_message":
+        return None
+
+    text = item.get("text")
+    if text is None:
+        text = event.get("text") or event.get("delta")
+    if text is None and isinstance(item.get("content"), list):
+        parts = []
+        for part in item["content"]:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        text = "".join(parts)
+
+    visible_text, _upload_paths = split_upload_directives(text or "")
+    return visible_text.strip() or None
+
+
+def summarize_progress_text_event(event, max_length=900):
+    text = extract_agent_message_text(event)
+    if not text:
+        return None
+    normalized = redact_sensitive_text(normalize_zulip_math_markup(text))
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[:max_length].rstrip() + "\n..."
+
+
+def stream_codex_output(child, timeout, mode, progress_callback=None):
     chunks = []
+    pending_line = ""
+
+    def handle_stream_line(line):
+        stripped = line.strip()
+        if not stripped:
+            return
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            print(f"[codex_stream] mode={mode} text={stripped}", flush=True)
+            return
+        print(
+            "[codex_stream]"
+            f" mode={mode}"
+            f" event={event.get('type', '-')}"
+            f" data={json.dumps(event, ensure_ascii=True)}",
+            flush=True,
+        )
+        if progress_callback:
+            progress_callback(event)
+
     while True:
         try:
             chunk = child.read_nonblocking(size=4096, timeout=timeout)
@@ -820,35 +1206,39 @@ def stream_codex_output(child, timeout, mode):
             continue
 
         chunks.append(chunk)
-        for line in chunk.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                event = json.loads(stripped)
-            except json.JSONDecodeError:
-                print(f"[codex_stream] mode={mode} text={stripped}", flush=True)
-                continue
-            print(
-                "[codex_stream]"
-                f" mode={mode}"
-                f" event={event.get('type', '-')}"
-                f" data={json.dumps(event, ensure_ascii=True)}",
-                flush=True,
-            )
+        pending_line += chunk
+        lines = pending_line.splitlines(keepends=True)
+        pending_line = ""
+        for line in lines:
+            if line.endswith("\n") or line.endswith("\r"):
+                handle_stream_line(line)
+            else:
+                pending_line = line
+
+    if pending_line:
+        handle_stream_line(pending_line)
 
     return "".join(chunks)
 
 
-def run_codex(prompt, session_id=None):
+def run_codex(prompt, session_id=None, reasoning_effort=None, progress_callback=None):
     with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as tmp:
         output_file = tmp.name
 
     mode = "resume" if session_id else "new"
     if session_id:
-        codex_bin, args, timeout, workdir = build_codex_resume_args(session_id, prompt, output_file)
+        codex_bin, args, timeout, workdir = build_codex_resume_args(
+            session_id,
+            prompt,
+            output_file,
+            reasoning_effort=reasoning_effort,
+        )
     else:
-        codex_bin, args, timeout, workdir = build_codex_exec_args(prompt, output_file)
+        codex_bin, args, timeout, workdir = build_codex_exec_args(
+            prompt,
+            output_file,
+            reasoning_effort=reasoning_effort,
+        )
     log_codex_command(mode, workdir, [codex_bin, *args])
 
     child_env = os.environ.copy()
@@ -863,7 +1253,7 @@ def run_codex(prompt, session_id=None):
     )
 
     try:
-        raw_output = stream_codex_output(child, timeout, mode)
+        raw_output = stream_codex_output(child, timeout, mode, progress_callback=progress_callback)
     except pexpect.TIMEOUT:
         child.close(force=True)
         return session_id, f"Codex timed out after {timeout} seconds."
@@ -936,9 +1326,13 @@ def extract_message_context(message):
     return prompt.strip(), links
 
 
-def build_status_text(session_id, force_fresh):
+def build_status_text(session_id, force_fresh, dispatch_mode="normal"):
     if force_fresh:
         return "正在强制启动一个新的 Codex 会话，请稍等。"
+    if dispatch_mode == "guide":
+        return "正在按引导模式发送给 Codex，请稍等。"
+    if dispatch_mode == "queue":
+        return "正在执行已排队的 Codex 任务，请稍等。"
     if session_id:
         return "正在继续当前 Zulip 对话的 Codex 会话，请稍等。"
     return "正在启动当前 Zulip 对话的 Codex 会话，请稍等。"
@@ -976,6 +1370,15 @@ def send_message(client, message, content):
         raise RuntimeError(f"Failed to send Zulip message: {result}")
 
 
+def try_send_message(client, message, content):
+    try:
+        send_message(client, message, content)
+        return True
+    except Exception as exc:
+        print(f"[zulip_send_error] error={exc!r}", flush=True)
+        return False
+
+
 def post_chunks(client, message, text):
     normalized = normalize_zulip_math_markup(text)
     if normalized != text:
@@ -988,6 +1391,53 @@ def post_chunks(client, message, text):
         )
     for chunk in chunk_text(normalized):
         send_message(client, message, chunk)
+
+
+def build_progress_callback(client, message, progress_mode="text"):
+    last_sent_at = 0.0
+    last_text = None
+    disabled = False
+    sent_texts = []
+    interval = get_progress_interval_seconds()
+
+    def callback(event):
+        nonlocal disabled, last_sent_at, last_text, sent_texts
+        if disabled:
+            return
+        if progress_mode == "steps":
+            text = summarize_progress_event(event)
+            prefix = "进度："
+        else:
+            text = summarize_progress_text_event(event)
+            prefix = "进展：\n"
+        if not text or text == last_text:
+            return
+        now = time.time()
+        if now - last_sent_at < interval:
+            return
+        last_sent_at = now
+        last_text = text
+        try:
+            send_message(client, message, f"{prefix}{text}")
+            if progress_mode == "text":
+                sent_texts.append(text)
+        except Exception as exc:
+            disabled = True
+            print(f"[progress] disabled_after_send_error error={exc}", flush=True)
+
+    callback.sent_texts = sent_texts
+    return callback
+
+
+def final_reply_duplicates_progress(final_reply, progress_callback):
+    sent_texts = getattr(progress_callback, "sent_texts", None)
+    if not sent_texts:
+        return False
+    normalized_final = normalize_progress_compare_text(final_reply)
+    if not normalized_final:
+        return False
+    normalized_last = normalize_progress_compare_text(sent_texts[-1])
+    return normalized_last == normalized_final
 
 
 def should_skip_message(message):
@@ -1008,42 +1458,128 @@ def process_message(client, message):
             send_message(client, message, "给我一个具体任务，再让我调用 Codex。")
             return
 
+        dispatch_mode, dispatch_prompt = parse_dispatch_directive(prompt)
+        if dispatch_mode == "queue":
+            if not dispatch_prompt and not attachment_links:
+                send_message(client, message, "`/queue` 后面要跟具体任务。")
+                return
+            if not message.get("_queue_ack_sent"):
+                send_message(client, message, "已加入当前 Zulip 对话队列；轮到时会继续执行。")
+
         lock = get_thread_lock(thread_key)
         with lock:
-            if is_session_command(prompt):
+            if dispatch_mode == "normal" and is_session_command(prompt):
                 current_session_id = SESSION_STORE.get(thread_key)
-                reply = (
-                    f"当前 Zulip 对话的 Codex session id: `{current_session_id}`"
-                    if current_session_id
-                    else "当前 Zulip 对话还没有 Codex session。"
-                )
+                current_effort = SESSION_STORE.get_effort(thread_key) or get_default_reasoning_effort()
+                current_progress = get_progress_mode(thread_key)
+                if current_session_id:
+                    attached_note = " (attached)" if SESSION_STORE.is_attached(thread_key) else ""
+                    reply = f"当前 Zulip 对话的 Codex session id: `{current_session_id}`{attached_note}"
+                else:
+                    reply = "当前 Zulip 对话还没有 Codex session。"
+                if current_effort:
+                    reply += f"\n当前 reasoning effort: `{current_effort}`"
+                reply += f"\n当前 progress: `{current_progress}`"
                 send_message(client, message, reply)
                 return
 
-            if is_reset_command(prompt):
+            if dispatch_mode == "normal" and is_effort_command(prompt):
+                effort = parse_effort_value(prompt)
+                if not effort:
+                    current_effort = SESSION_STORE.get_effort(thread_key) or get_default_reasoning_effort()
+                    if current_effort:
+                        send_message(client, message, f"当前 reasoning effort: `{current_effort}`")
+                    else:
+                        send_message(client, message, "当前 Zulip 对话没有设置 reasoning effort。")
+                    return
+                if effort in {"clear", "reset", "unset"}:
+                    SESSION_STORE.clear_effort(thread_key)
+                    log_session_event("effort_clear", thread_key, next_session_id=SESSION_STORE.get(thread_key))
+                    send_message(client, message, "当前 Zulip 对话的 reasoning effort 覆盖已清除。")
+                    return
+                if normalize_reasoning_effort(effort) is None:
+                    allowed = ", ".join(sorted(REASONING_EFFORT_VALUES))
+                    send_message(client, message, f"用法: `/effort <{allowed}|clear>`")
+                    return
+                SESSION_STORE.set_effort(thread_key, effort)
+                log_session_event("effort", thread_key, next_session_id=SESSION_STORE.get(thread_key))
+                send_message(client, message, f"当前 Zulip 对话的 reasoning effort 已设置为 `{effort}`，下一轮 Codex 调用生效。")
+                return
+
+            if dispatch_mode == "normal" and is_progress_command(prompt):
+                value = parse_progress_value(prompt)
+                if not value or value == "status":
+                    current_progress = get_progress_mode(thread_key)
+                    send_message(client, message, f"当前 progress: `{current_progress}`")
+                    return
+                if value in {"clear", "reset", "unset"}:
+                    SESSION_STORE.clear_progress(thread_key)
+                    log_session_event("progress_clear", thread_key, next_session_id=SESSION_STORE.get(thread_key))
+                    send_message(client, message, "当前 Zulip 对话的 progress 覆盖已清除。")
+                    return
+                progress = normalize_progress_value(value)
+                if progress is None:
+                    send_message(client, message, "用法: `/progress <on|text|steps|off|status|clear>`")
+                    return
+                SESSION_STORE.set_progress(thread_key, progress)
+                log_session_event("progress", thread_key, next_session_id=SESSION_STORE.get(thread_key))
+                send_message(client, message, f"当前 Zulip 对话的 progress 已设置为 `{progress}`。")
+                return
+
+            if dispatch_mode == "normal" and is_attach_command(prompt):
+                session_id = parse_attach_session_id(prompt)
+                if not session_id or len(session_id.split()) != 1:
+                    send_message(client, message, "用法: `/attach <codex-session-id>`")
+                    return
+                SESSION_STORE.set(thread_key, session_id, attached=True)
+                log_session_event("attach", thread_key, next_session_id=session_id)
+                send_message(client, message, f"当前 Zulip 对话已绑定到 Codex session: `{session_id}`")
+                return
+
+            if dispatch_mode == "normal" and is_reset_command(prompt):
                 previous_session_id = SESSION_STORE.get(thread_key)
                 SESSION_STORE.delete(thread_key)
                 log_session_event("reset", thread_key, existing_session_id=previous_session_id)
                 send_message(client, message, "当前 Zulip 对话的 Codex 会话已重置。")
                 return
 
-            force_fresh = is_fresh_command(prompt)
-            effective_prompt = strip_fresh_command(prompt) if force_fresh else prompt
+            force_fresh = is_fresh_command(dispatch_prompt)
+            effective_prompt = strip_fresh_command(dispatch_prompt) if force_fresh else dispatch_prompt
             if not effective_prompt and not attachment_links:
-                send_message(client, message, "`/fresh` 后面要跟具体任务。")
+                command_name = "/guide" if dispatch_mode == "guide" else "/fresh"
+                send_message(client, message, f"`{command_name}` 后面要跟具体任务。")
                 return
 
             existing_session_id = None if force_fresh else SESSION_STORE.get(thread_key)
+            existing_session_attached = False if force_fresh else SESSION_STORE.is_attached(thread_key)
+            reasoning_effort = SESSION_STORE.get_effort(thread_key)
+            stored_progress = SESSION_STORE.get_progress(thread_key)
             log_session_event(
                 "fresh_attempt" if force_fresh else ("resume_attempt" if existing_session_id else "new_attempt"),
                 thread_key,
                 existing_session_id=existing_session_id,
             )
-            send_message(client, message, build_status_text(existing_session_id, force_fresh))
+            send_message(client, message, build_status_text(existing_session_id, force_fresh, dispatch_mode))
 
             attachments = download_message_attachments(client, message, links)
-            codex_prompt = build_codex_prompt(effective_prompt, attachments)
-            next_session_id, result = run_codex(codex_prompt, session_id=existing_session_id)
+            progress_mode = get_progress_mode(thread_key)
+            codex_prompt = build_codex_prompt(
+                effective_prompt,
+                attachments,
+                dispatch_mode=dispatch_mode,
+                progress_mode=progress_mode,
+            )
+            progress_callback = (
+                build_progress_callback(client, message, progress_mode=progress_mode)
+                if progress_mode != "off"
+                else None
+            )
+            next_session_id, result = run_codex(
+                codex_prompt,
+                session_id=existing_session_id,
+                reasoning_effort=reasoning_effort,
+                progress_callback=progress_callback,
+            )
             print(
                 "[codex_result]"
                 f" thread_key={thread_key}"
@@ -1052,14 +1588,35 @@ def process_message(client, message):
             )
 
             if existing_session_id and is_invalid_session_result(result):
+                if existing_session_attached:
+                    log_session_event(
+                        "attached_resume_failed",
+                        thread_key,
+                        existing_session_id=existing_session_id,
+                    )
+                    send_message(
+                        client,
+                        message,
+                        "当前 attached Codex session 不可恢复。请重新 `/attach <session_id>`，或用 `/fresh 任务` 新建会话。",
+                    )
+                    return
+
                 log_session_event(
                     "resume_failed_rebuild",
                     thread_key,
                     existing_session_id=existing_session_id,
                 )
                 SESSION_STORE.delete(thread_key)
+                if reasoning_effort:
+                    SESSION_STORE.set_effort(thread_key, reasoning_effort)
+                if stored_progress:
+                    SESSION_STORE.set_progress(thread_key, stored_progress)
                 send_message(client, message, "当前 Zulip 对话的 Codex 会话不可恢复，正在自动重建新会话。")
-                next_session_id, result = run_codex(codex_prompt)
+                next_session_id, result = run_codex(
+                    codex_prompt,
+                    reasoning_effort=reasoning_effort,
+                    progress_callback=progress_callback,
+                )
 
             if next_session_id and next_session_id != existing_session_id:
                 SESSION_STORE.set(thread_key, next_session_id)
@@ -1075,6 +1632,8 @@ def process_message(client, message):
             visible_result, upload_paths = split_upload_directives(result)
             uploaded_links, upload_errors = upload_requested_files(client, upload_paths)
             final_reply = build_final_reply(visible_result, uploaded_links, upload_errors)
+            if progress_mode == "text" and final_reply_duplicates_progress(final_reply, progress_callback):
+                final_reply = "Codex 已完成；最终内容与上一条进展相同。"
             post_chunks(client, message, final_reply)
     except Exception as exc:
         print(
@@ -1090,12 +1649,54 @@ def process_message(client, message):
 
 
 def start_background_job(client, message):
+    prompt, links = extract_message_context(message)
+    dispatch_mode, dispatch_prompt = parse_dispatch_directive(prompt)
+    attachment_links = [item for item in links if is_attachment_link(item.get("href", ""))]
+    if dispatch_mode == "queue":
+        if not dispatch_prompt and not attachment_links:
+            try_send_message(client, message, "`/queue` 后面要跟具体任务。")
+            return
+        try_send_message(client, message, "已加入当前 Zulip 对话队列；轮到时会继续执行。")
+        message["_queue_ack_sent"] = True
+
+    thread_key = make_conversation_key(message)
+    should_ack_implicit_queue = False
+    should_start_worker = False
+    with THREAD_WORK_QUEUES_GUARD:
+        state = THREAD_WORK_QUEUES.get(thread_key)
+        if state is None:
+            state = {"messages": deque(), "active": False}
+            THREAD_WORK_QUEUES[thread_key] = state
+        should_ack_implicit_queue = state["active"] and dispatch_mode != "queue"
+        state["messages"].append(message)
+        if state["active"]:
+            should_start_worker = False
+        else:
+            state["active"] = True
+            should_start_worker = True
+    if should_ack_implicit_queue:
+        try_send_message(client, message, "当前 Zulip 对话已有任务在运行；这条消息已加入队列。")
+    if not should_start_worker:
+        return
+
     thread = threading.Thread(
-        target=process_message,
-        args=(client, message),
+        target=process_message_queue,
+        args=(client, thread_key),
         daemon=True,
     )
     thread.start()
+
+
+def process_message_queue(client, thread_key):
+    while True:
+        with THREAD_WORK_QUEUES_GUARD:
+            state = THREAD_WORK_QUEUES.get(thread_key)
+            if not state or not state["messages"]:
+                if state:
+                    state["active"] = False
+                return
+            message = state["messages"].popleft()
+        process_message(client, message)
 
 
 def validate_env():
@@ -1175,7 +1776,15 @@ def run_event_loop(client):
 
         for event in result.get("events", []):
             last_event_id = max(last_event_id, event.get("id", last_event_id))
-            handle_event(client, event)
+            try:
+                handle_event(client, event)
+            except Exception as exc:
+                print(
+                    "[zulip_event_error]"
+                    f" event_id={event.get('id', '-')}"
+                    f" error={exc!r}",
+                    flush=True,
+                )
 
 
 def log_session_event(event, thread_key, existing_session_id=None, next_session_id=None):
@@ -1183,8 +1792,8 @@ def log_session_event(event, thread_key, existing_session_id=None, next_session_
         "[session]"
         f" event={event}"
         f" thread_key={thread_key}"
-        f" existing_session_id={existing_session_id or '-'}"
-        f" next_session_id={next_session_id or '-'}",
+        f" existing_session_id={compact_log_id(existing_session_id)}"
+        f" next_session_id={compact_log_id(next_session_id)}",
         flush=True,
     )
 
@@ -1194,16 +1803,16 @@ def log_codex_command(mode, workdir, args):
         "[codex_cmd]"
         f" mode={mode}"
         f" cwd={workdir}"
-        f" args={json.dumps(args, ensure_ascii=True)}",
+        f" args={json.dumps(summarize_logged_codex_args(args), ensure_ascii=True)}",
         flush=True,
     )
 
 
 def log_codex_result(mode, exit_code, raw_output, final_output):
-    raw_preview = (raw_output or "").strip().replace("\n", "\\n")
+    raw_preview = redact_sensitive_text(raw_output or "").strip().replace("\n", "\\n")
     if len(raw_preview) > 500:
         raw_preview = raw_preview[:500] + "...<truncated>"
-    final_preview = (final_output or "").strip().replace("\n", "\\n")
+    final_preview = redact_sensitive_text(final_output or "").strip().replace("\n", "\\n")
     if len(final_preview) > 500:
         final_preview = final_preview[:500] + "...<truncated>"
     print(
